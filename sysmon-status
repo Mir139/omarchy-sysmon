@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Omarchy bar module: CPU load, Intel iGPU load and RAM usage.
+# Prints Waybar-style JSON ({"text","tooltip"}) for a `command` bar module.
+#
+# CPU: delta of /proc/stat between two runs.
+# GPU: 100% minus the share of time spent in RC6 (GPU idle state), read from
+#      sysfs, so no root and no intel_gpu_top are needed. Works with i915 and xe.
+# RAM: MemTotal - MemAvailable from /proc/meminfo.
+
+set -u
+
+STATE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-sysmon.state"
+
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+
+cpu_sample() { # -> "total idle"
+  local _ user nice system idle iowait irq softirq steal
+  read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+  echo "$((user + nice + system + idle + iowait + irq + softirq + steal)) $((idle + iowait))"
+}
+
+gpu_idle_file() {
+  local f
+  for f in /sys/class/drm/card*/gt/gt0/rc6_residency_ms \
+           /sys/class/drm/card*/device/tile0/gt0/gtidle/idle_residency_ms; do
+    [[ -r $f ]] && { echo "$f"; return; }
+  done
+}
+
+gpu_file=$(gpu_idle_file)
+gpu_sample() { [[ -n $gpu_file ]] && cat "$gpu_file" || echo 0; }
+
+# Current sample.
+read -r cpu_total cpu_idle < <(cpu_sample)
+gpu_idle=$(gpu_sample)
+t=$(now_ms)
+
+# Previous sample; on first run take a short one ourselves.
+if [[ -r $STATE ]]; then
+  read -r p_total p_idle p_gpu p_t < "$STATE"
+else
+  p_total=$cpu_total p_idle=$cpu_idle p_gpu=$gpu_idle p_t=$t
+  sleep 0.3
+  read -r cpu_total cpu_idle < <(cpu_sample)
+  gpu_idle=$(gpu_sample)
+  t=$(now_ms)
+fi
+echo "$cpu_total $cpu_idle $gpu_idle $t" > "$STATE"
+
+pct() { # busy_delta total_delta -> clamped integer percent
+  local v=0
+  (( $2 > 0 )) && v=$(( 100 * $1 / $2 ))
+  (( v < 0 )) && v=0
+  (( v > 100 )) && v=100
+  echo "$v"
+}
+
+d_total=$((cpu_total - p_total))
+cpu=$(pct $((d_total - (cpu_idle - p_idle))) "$d_total")
+
+gpu=""
+if [[ -n $gpu_file ]]; then
+  d_t=$((t - p_t))
+  gpu=$(pct $((d_t - (gpu_idle - p_gpu))) "$d_t")
+fi
+
+read -r mem_total mem_avail < <(awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} END{print t, a}' /proc/meminfo)
+mem_used=$((mem_total - mem_avail))
+ram_gib=$(awk -v k="$mem_used" 'BEGIN{printf "%.1f", k/1048576}')
+ram_pct=$(pct "$mem_used" "$mem_total")
+ram_total_gib=$(awk -v k="$mem_total" 'BEGIN{printf "%.1f", k/1048576}')
+
+ICON_CPU=$'\U000f0ee0'
+ICON_GPU=$'\U000f08ae'
+ICON_RAM=$'\U000f035b'
+
+text="${ICON_CPU} ${cpu}%"
+tooltip="CPU: ${cpu}%"
+if [[ -n $gpu ]]; then
+  text+="  ${ICON_GPU} ${gpu}%"
+  tooltip+="\nGPU: ${gpu}%"
+fi
+text+="  ${ICON_RAM} ${ram_gib}G"
+tooltip+="\nRAM: ${ram_gib} / ${ram_total_gib} GiB (${ram_pct}%)"
+
+class=normal
+(( cpu >= 90 || ram_pct >= 90 )) && class=critical
+
+printf '{"text":"%s","tooltip":"%s","class":"%s"}\n' "$text" "$tooltip" "$class"
