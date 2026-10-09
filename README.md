@@ -23,7 +23,7 @@ State between runs is kept in `$XDG_RUNTIME_DIR/omarchy-sysmon.state`.
 Requires `jq` and a Nerd Font (Omarchy ships one).
 
 ```bash
-git clone <this repo> && cd omarchy-sysmon
+git clone https://github.com/Mir139/omarchy-sysmon && cd omarchy-sysmon
 ./install.sh
 ```
 
